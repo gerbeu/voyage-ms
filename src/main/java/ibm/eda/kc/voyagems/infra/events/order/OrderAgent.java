@@ -1,13 +1,16 @@
 package ibm.eda.kc.voyagems.infra.events.order;
 
+import java.util.Optional;
 import java.util.concurrent.CompletionStage;
 import java.util.logging.Logger;
 
 import javax.enterprise.context.ApplicationScoped;
 import javax.inject.Inject;
 
-import org.eclipse.microprofile.reactive.messaging.Incoming;
-import org.eclipse.microprofile.reactive.messaging.Message;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Scope;
+import io.smallrye.reactive.messaging.TracingMetadata;
+import org.eclipse.microprofile.reactive.messaging.*;
 
 import ibm.eda.kc.voyagems.domain.Voyage;
 import ibm.eda.kc.voyagems.infra.events.voyage.VoyageAllocated;
@@ -32,24 +35,31 @@ public class OrderAgent {
     VoyageEventProducer voyageEventProducer;
 
     @Incoming("orders")
-    public CompletionStage<Void> processOrder(Message<OrderEvent> messageWithOrderEvent){
+    public CompletionStage<Void> processOrder(Message<OrderEvent> messageWithOrderEvent) {
         logger.info("Received order : " + messageWithOrderEvent.getPayload().orderID);
         OrderEvent oe = messageWithOrderEvent.getPayload();
-        switch( oe.getType()){
-            case OrderEvent.ORDER_CREATED_TYPE:
-                processOrderCreatedEvent(oe);
-                break;
-            case OrderEvent.ORDER_UPDATED_TYPE:
-                logger.info("Receive order update " + oe.status);
-                if (oe.status.equals(OrderEvent.ORDER_ON_HOLD_TYPE)) {
-                    compensateOrder(oe.orderID,oe.quantity);
-                } else {
-                    logger.info("Do future processing in case of order update");
+        Optional<TracingMetadata> optionalTracingMetadata = TracingMetadata.fromMessage(messageWithOrderEvent);
+        if (optionalTracingMetadata.isPresent()) {
+            TracingMetadata tracingMetadata = optionalTracingMetadata.get();
+            try (Scope scope = tracingMetadata.getCurrentContext().makeCurrent()) {
+                logger.info("TraceId " + Span.current().getSpanContext().getTraceId());
+                switch (oe.getType()) {
+                    case OrderEvent.ORDER_CREATED_TYPE:
+                        processOrderCreatedEvent(oe);
+                        break;
+                    case OrderEvent.ORDER_UPDATED_TYPE:
+                        logger.info("Receive order update " + oe.status);
+                        if (oe.status.equals(OrderEvent.ORDER_ON_HOLD_TYPE)) {
+                            compensateOrder(oe.orderID, oe.quantity);
+                        } else {
+                            logger.info("Do future processing in case of order update");
+                        }
+
+                        break;
+                    default:
+                        break;
                 }
-                    
-                break;
-            default:
-                break;
+            }
         }
         return messageWithOrderEvent.ack();
     }
@@ -58,12 +68,12 @@ public class OrderAgent {
      * When order created, search for voyage close to the pickup location, and a distination close
      * for a given date
      */
-    public VoyageEvent processOrderCreatedEvent( OrderEvent oe){
-        OrderCreatedEvent oce = (OrderCreatedEvent)oe.payload;
-        Voyage voyage = repo.getVoyageForOrder(oe.orderID, 
-                                oce.pickupCity, 
-                                oce.destinationCity,
-                                oe.quantity);
+    public VoyageEvent processOrderCreatedEvent(OrderEvent oe) {
+        OrderCreatedEvent oce = (OrderCreatedEvent) oe.payload;
+        Voyage voyage = repo.getVoyageForOrder(oe.orderID,
+                oce.pickupCity,
+                oce.destinationCity,
+                oe.quantity);
         VoyageEvent ve = new VoyageEvent();
         if (voyage == null) {
             // normally do nothing
@@ -73,14 +83,14 @@ public class OrderAgent {
             ve.voyageID = voyage.voyageID;
             ve.setType(VoyageEvent.TYPE_VOYAGE_ASSIGNED);
             ve.payload = voyageAssignedEvent;
-           
-            voyageEventProducer.sendEvent(ve.voyageID,ve);
+
+            voyageEventProducer.sendEvent(ve.voyageID, ve);
         }
         return ve;
     }
- 
-    public void compensateOrder(String txid,long capacity) {
+
+    public void compensateOrder(String txid, long capacity) {
         logger.info("Compensate on order " + txid);
-        repo.cleanTransaction(txid,capacity);
+        repo.cleanTransaction(txid, capacity);
     }
 }
